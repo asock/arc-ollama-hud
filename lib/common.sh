@@ -57,6 +57,32 @@ safe_int()      { [[ "$1" =~ ^[0-9]+$ ]] && echo "$1" || echo 0; }
 safe_num()      { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] && echo "$1" || echo 0; }
 div_fmt()       { awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN{if(b>0) printf "%.2f",a/b; else print ""}'; }
 
+# ── Intel Arc GPU device ID → friendly name ──────────────────────────────────
+# Usage: gpu_name_lookup "0x56a0"  →  "Arc A770"  (empty string if unknown)
+# Device IDs sourced from kernel drm/i915 and drm/xe device tables.
+gpu_name_lookup() {
+  case "${1,,}" in
+    # ── Alchemist / DG2 (Arc A-series discrete) ──
+    0x56a0) echo "Arc A770"    ;;
+    0x56a1) echo "Arc A750"    ;;
+    0x56a5) echo "Arc A580"    ;;
+    0x56a6) echo "Arc A380"    ;;
+    0x56b0) echo "Arc A770M"   ;;
+    0x56b1) echo "Arc A730M"   ;;
+    0x56b2) echo "Arc A550M"   ;;
+    0x56b3) echo "Arc A350M"   ;;
+    0x5694) echo "Arc A370M"   ;;
+    0x5693) echo "Arc A330M"   ;;
+    0x5692) echo "Arc A310M"   ;;
+    0x56c0) echo "Arc Pro A40" ;;
+    0x56c1) echo "Arc Pro A50" ;;
+    # ── Battlemage / BMG (Arc B-series discrete) ──
+    0xe20b) echo "Arc B580"    ;;
+    0xe20a) echo "Arc B770"    ;;
+    *)      echo ""            ;;
+  esac
+}
+
 # ── GPU stats struct (populates associative array) ────────────────────────────
 # Usage: gpu_read_stats DEV  (sets GPU_BUSY GPU_USED_RAW GPU_TOTAL_RAW
 #        GPU_FREQ GPU_POWER_W GPU_TEMP_C GPU_MEM_PCT GPU_USED_MIB GPU_TOTAL_MIB)

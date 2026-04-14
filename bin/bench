@@ -260,8 +260,11 @@ _write_report() {
 printf "%b╔══════════════════════════════════════════════════════════╗%b\n" "$C_MAG" "$C_RESET"
 printf "%b║   arc-ollama-hud / bench                                 ║%b\n" "$C_MAG" "$C_RESET"
 printf "%b╚══════════════════════════════════════════════════════════╝%b\n" "$C_MAG" "$C_RESET"
-printf "  Model:   %b%s%b\n  Card:    %s (%s)\n  Runs:    %s\n  Out dir: %s\n\n" \
-  "$C_BOLD" "$MODEL" "$C_RESET" "$CARD" "$DRIVER" "$RUNS" "$OUT_DIR"
+# U1: Show friendly GPU name in the startup summary when the device ID is known.
+_gpu_name="$(gpu_name_lookup "$(gpu_read "${DEV:-}/device")")"
+_card_label="${_gpu_name:+$_gpu_name / }${CARD} (${DRIVER})"
+printf "  Model:   %b%s%b\n  Card:    %s\n  Runs:    %s\n  Out dir: %s\n\n" \
+  "$C_BOLD" "$MODEL" "$C_RESET" "$_card_label" "$RUNS" "$OUT_DIR"
 
 if (( WARMUP )); then
   printf "%b  warm-up run (discarded)…%b\n" "$C_DIM" "$C_RESET"

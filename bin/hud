@@ -20,6 +20,12 @@ INTERVAL="${1:-1}"
 OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
 STATE_DIR="${STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/arc-ollama-hud}"
 mkdir -p "$STATE_DIR"
+# U7: Warn once at startup if the state dir is not writable — sparklines will
+#     silently show "─" for every metric, which is confusing without this.
+if [[ ! -w "$STATE_DIR" ]]; then
+  printf '%bWarning: STATE_DIR %s is not writable — history/sparklines disabled.%b\n' \
+    "$C_YELLOW" "$STATE_DIR" "$C_RESET" >&2
+fi
 
 CARD_PATH=''
 DEV=''
@@ -60,12 +66,15 @@ _draw_gpu() {
 
   gpu_read_stats "$DEV"
 
-  local card driver pci vendor device
+  local card driver pci vendor device gpu_name name_str
   card="$(basename "$CARD_PATH")"
   driver="$(basename "$(readlink -f "$DEV/driver" 2>/dev/null)" 2>/dev/null || echo '?')"
   pci="$(basename "$(readlink -f "$DEV" 2>/dev/null)" 2>/dev/null || echo '?')"
   vendor="$(gpu_read "$DEV/vendor")"
   device="$(gpu_read "$DEV/device")"
+  # U1: Show a human-readable GPU name alongside the raw PCI device ID.
+  gpu_name="$(gpu_name_lookup "$device")"
+  name_str="${gpu_name:+$gpu_name  }(${vendor}:${device})"
 
   hist_append "$STATE_DIR/busy.hist"  "$GPU_BUSY"
   hist_append "$STATE_DIR/mem.hist"   "$GPU_MEM_PCT"
@@ -73,7 +82,7 @@ _draw_gpu() {
 
   ui_kv "Card"        "$card  (PCI $pci)"
   ui_kv "Driver"      "$driver"
-  ui_kv "IDs"         "${vendor}:${device}"
+  ui_kv "GPU"         "$name_str"
   ui_kv "GPU Busy"    "$(ui_bar "$GPU_BUSY" 28)"
   ui_kv "  ↳ trend"   "$(ui_spark "$STATE_DIR/busy.hist" 100)"
   ui_kv "VRAM"        "$(ui_bar "$GPU_MEM_PCT" 28)  ${GPU_USED_MIB:-?} / ${GPU_TOTAL_MIB:-?} MiB"
