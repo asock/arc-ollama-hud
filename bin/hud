@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# bin/hud  –  Live Intel Arc/xe + Ollama dashboard
+# Usage: hud [INTERVAL_SECONDS]
+#   env: GPU_CARD, OLLAMA_HOST, NO_COLOR, STATE_DIR
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+require_cmds curl jq ps awk || exit 1
+
+INTERVAL="${1:-1}"
+OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
+STATE_DIR="${STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/arc-ollama-hud}"
+mkdir -p "$STATE_DIR"
+
+CARD_PATH=''
+DEV=''
+
+_init_card() {
+  CARD_PATH="$(gpu_find_card 2>/dev/null)" || true
+  DEV="${CARD_PATH:+$CARD_PATH/device}"
+}
+
+_olm_fetch() {
+  curl -fsS --connect-timeout 1 --max-time 2 "$OLLAMA_HOST/$1" 2>/dev/null || true
+}
+
+_draw_header() {
+  local ts="$1"
+  printf "%b┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓%b\n" "$C_MAG" "$C_RESET"
+  printf "%b┃%b  ARC / xe + OLLAMA NERD HUD  %b[interval %ss]%b  %b%s%b  ┃\n" \
+    "$C_MAG" "$C_RESET" "$C_DIM" "$INTERVAL" "$C_RESET" "$C_DIM" "$ts" "$C_RESET"
+  printf "%b┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛%b\n" "$C_MAG" "$C_RESET"
+}
+
+_draw_gpu() {
+  ui_panel "GPU"
+
+  if [[ -z "$CARD_PATH" ]]; then
+    printf "%b  No Intel DRM card detected.  Set GPU_CARD=cardN to override.%b\n" "$C_RED" "$C_RESET"
+    return
+  fi
+
+  gpu_read_stats "$DEV"
+
+  local card driver pci vendor device
+  card="$(basename "$CARD_PATH")"
+  driver="$(basename "$(readlink -f "$DEV/driver" 2>/dev/null)" 2>/dev/null || echo '?')"
+  pci="$(basename "$(readlink -f "$DEV" 2>/dev/null)" 2>/dev/null || echo '?')"
+  vendor="$(gpu_read "$DEV/vendor")"
+  device="$(gpu_read "$DEV/device")"
+
+  hist_append "$STATE_DIR/busy.hist"  "$GPU_BUSY"
+  hist_append "$STATE_DIR/mem.hist"   "$GPU_MEM_PCT"
+  hist_append "$STATE_DIR/temp.hist"  "$(safe_int "${GPU_TEMP_C%%.*}")"
+
+  ui_kv "Card"        "$card  (PCI $pci)"
+  ui_kv "Driver"      "$driver"
+  ui_kv "IDs"         "${vendor}:${device}"
+  ui_kv "GPU Busy"    "$(ui_bar "$GPU_BUSY" 28)"
+  ui_kv "  ↳ trend"   "$(ui_spark "$STATE_DIR/busy.hist" 100)"
+  ui_kv "VRAM"        "$(ui_bar "$GPU_MEM_PCT" 28)  ${GPU_USED_MIB:-?} / ${GPU_TOTAL_MIB:-?} MiB"
+  ui_kv "  ↳ trend"   "$(ui_spark "$STATE_DIR/mem.hist" 100)"
+  ui_kv "Freq"        "${GPU_FREQ:-?} MHz"
+  ui_kv "Power"       "${GPU_POWER_W:-?} W"
+  ui_kv "Temp"        "${GPU_TEMP_C:-?} °C  $(ui_spark "$STATE_DIR/temp.hist" 120)"
+}
+
+_draw_ollama() {
+  ui_panel "Ollama"
+
+  local tags_json ps_json model_count
+  tags_json="$(_olm_fetch api/tags)"
+  ps_json="$(_olm_fetch api/ps)"
+
+  if [[ -n "$tags_json" ]]; then
+    model_count="$(jq '.models | length' <<< "$tags_json" 2>/dev/null || echo '?')"
+    ui_kv "API Status"  "${C_GREEN}up${C_RESET}  $OLLAMA_HOST"
+    ui_kv "Models"      "$model_count installed"
+  else
+    ui_kv "API Status"  "${C_RED}down${C_RESET}  $OLLAMA_HOST"
+    ui_kv "Models"      "n/a"
+  fi
+
+  local active_count=0
+  if [[ -n "$ps_json" ]]; then
+    active_count="$(jq '.models | length' <<< "$ps_json" 2>/dev/null || echo 0)"
+  fi
+
+  if (( active_count > 0 )); then
+    printf "\n  %b%-30s %-12s %-10s %-24s%b\n" \
+      "$C_DIM" "MODEL" "STATE" "VRAM MiB" "EXPIRES" "$C_RESET"
+    printf "  %b%s%b\n" "$C_GRAY" "$(printf '%.0s─' {1..80})" "$C_RESET"
+    jq -r '.models[] | [.name, (.state//"?"), (.size_vram//0), (.expires_at//"?")] | @tsv' \
+      <<< "$ps_json" 2>/dev/null |
+    while IFS=$'\t' read -r name state vram expires; do
+      [[ -n "$name" ]] || continue
+      printf "  %-30s %-12s %-10s %-24s\n" \
+        "$name" "$state" "$(bytes_to_mib "$vram")" "$expires"
+    done
+  else
+    ui_kv "Active"     "none"
+  fi
+}
+
+_draw_processes() {
+  ui_panel "Processes"
+  printf "%b  %-7s %-7s %-6s %-6s %-10s %s%b\n" \
+    "$C_DIM" "PID" "PPID" "%CPU" "%MEM" "ETIME" "CMD" "$C_RESET"
+  ps -eo pid,ppid,%cpu,%mem,etime,cmd --sort=-%cpu 2>/dev/null \
+    | grep -Ei 'ollama|llama|vulkan|intel|gpu' \
+    | grep -v grep \
+    | head -n 10 \
+    || echo "  none"
+}
+
+_draw_hints() {
+  ui_panel "Hints"
+  cat <<-'HINTS'
+  • GPU busy % + power should spike during LLM generation.
+  • VRAM trend flat while Ollama is active → likely CPU fallback.
+  • Set GPU_CARD=card1 to target a specific card.
+  • Set OLLAMA_HOST to point at a remote instance.
+  • NO_COLOR=1 disables ANSI colours (e.g. for log redirection).
+HINTS
+}
+
+_init_card
+
+# Graceful exit on Ctrl-C
+trap 'printf "\n%bExiting.%b\n" "$C_CYAN" "$C_RESET"; exit 0' INT TERM
+
+while true; do
+  clear
+  _draw_header "$(date '+%F %T')"
+  _draw_gpu
+  ui_hr
+  _draw_ollama
+  ui_hr
+  _draw_processes
+  ui_hr
+  _draw_hints
+  sleep "$INTERVAL"
+done

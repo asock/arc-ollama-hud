@@ -1,0 +1,27 @@
+name: smoke-test
+
+on: [push, pull_request]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check scripts are executable
+        run: |
+          for f in bin/*; do
+            test -x "$f" || { echo "Not executable: $f"; exit 1; }
+          done
+
+      - name: Syntax check
+        run: |
+          bash -n lib/common.sh
+          bash -n bin/hud
+          bash -n bin/bench
+
+      - name: bench --help (no GPU, no Ollama)
+        run: bin/bench -h
+
+      - name: hud exits cleanly with no hardware
+        run: timeout 3 bin/hud || true

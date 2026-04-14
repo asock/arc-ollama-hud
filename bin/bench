@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# bin/bench  –  Token-throughput benchmark harness for Ollama on Intel Arc/xe
+#
+# Usage: bench [OPTIONS]
+#   -m MODEL         Ollama model name          (env: OLLAMA_MODEL)
+#   -p PROMPT        Prompt text                (env: OLLAMA_PROMPT)
+#   -P FILE          Read prompt from file
+#   -r RUNS          Number of runs  [5]        (env: RUNS)
+#   -s MS            GPU sample interval ms [200] (env: SAMPLE_MS)
+#   -o DIR           Output directory  [./bench-out]  (env: OUT_DIR)
+#   -H HOST          Ollama host  [http://127.0.0.1:11434]  (env: OLLAMA_HOST)
+#   -c CARD          Force GPU card  (env: GPU_CARD)
+#   -w               Warm-up run before recording (discarded from stats)
+#   -q               Quiet: suppress per-run output
+#   -h               Show this help
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+require_cmds curl jq awk ps || exit 1
+
+# ── Defaults (env-overridable, flag-overridable) ──────────────────────────────
+HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
+MODEL="${OLLAMA_MODEL:-}"
+PROMPT="${OLLAMA_PROMPT:-Summarise in exactly 3 sentences why GPU memory bandwidth matters for LLM inference.}"
+PROMPT_FILE=''
+RUNS="${RUNS:-5}"
+SAMPLE_MS="${SAMPLE_MS:-200}"
+OUT_DIR="${OUT_DIR:-./bench-out}"
+WARMUP=0
+QUIET=0
+
+usage() {
+  grep '^#' "$0" | sed 's/^# \?//' | tail -n +2 | head -n 20
+  exit 0
+}
+
+while getopts ':m:p:P:r:s:o:H:c:wqh' opt; do
+  case "$opt" in
+    m) MODEL="$OPTARG"      ;;
+    p) PROMPT="$OPTARG"     ;;
+    P) PROMPT_FILE="$OPTARG";;
+    r) RUNS="$OPTARG"       ;;
+    s) SAMPLE_MS="$OPTARG"  ;;
+    o) OUT_DIR="$OPTARG"    ;;
+    H) HOST="$OPTARG"       ;;
+    c) GPU_CARD="$OPTARG"   ;;
+    w) WARMUP=1             ;;
+    q) QUIET=1              ;;
+    h) usage                ;;
+    :) printf '%bMissing argument for -%s%b\n' "$C_RED" "$OPTARG" "$C_RESET" >&2; exit 1 ;;
+    \?) printf '%bUnknown flag -%s%b\n' "$C_RED" "$OPTARG" "$C_RESET" >&2; exit 1 ;;
+  esac
+done
+
+[[ -n "$PROMPT_FILE" ]] && PROMPT="$(<"$PROMPT_FILE")"
+
+# ── Resolve model ─────────────────────────────────────────────────────────────
+if [[ -z "$MODEL" ]]; then
+  MODEL="$(curl -fsS --max-time 5 "$HOST/api/tags" | jq -r '.models[0].name // empty' 2>/dev/null)"
+fi
+if [[ -z "$MODEL" ]]; then
+  printf '%bNo Ollama model found.  Use -m MODEL or set OLLAMA_MODEL.%b\n' "$C_RED" "$C_RESET" >&2
+  exit 1
+fi
+
+# ── Setup output ──────────────────────────────────────────────────────────────
+mkdir -p "$OUT_DIR"
+STAMP="$(date +%Y%m%d_%H%M%S)"
+SUMMARY_CSV="$OUT_DIR/summary_${STAMP}.csv"
+SAMPLES_CSV="$OUT_DIR/samples_${STAMP}.csv"
+REPORT_MD="$OUT_DIR/report_${STAMP}.md"
+REQ_JSON="$OUT_DIR/request_${STAMP}.json"
+
+# ── GPU setup ─────────────────────────────────────────────────────────────────
+CARD_PATH="$(gpu_find_card 2>/dev/null)" || CARD_PATH=''
+DEV="${CARD_PATH:+$CARD_PATH/device}"
+CARD="$(basename "$CARD_PATH" 2>/dev/null || echo 'unknown')"
+DRIVER="$(basename "$(readlink -f "$DEV/driver" 2>/dev/null)" 2>/dev/null || echo '?')"
+
+# ── CSV headers ───────────────────────────────────────────────────────────────
+printf 'run,timestamp,model,card,driver,'
+printf 'prompt_tokens,gen_tokens,load_s,prompt_eval_s,eval_s,total_s,'
+printf 'eval_tps,total_tps,response_chars,'
+printf 'samples,busy_avg,busy_max,vram_avg_mib,vram_max_mib,'
+printf 'freq_avg_mhz,freq_max_mhz,power_avg_w,power_max_w,temp_avg_c,temp_max_c\n' \
+  > "$SUMMARY_CSV"
+
+printf 'run,epoch_s,busy_pct,vram_mib,vram_total_mib,freq_mhz,power_w,temp_c\n' \
+  > "$SAMPLES_CSV"
+
+jq -n --arg model "$MODEL" --arg prompt "$PROMPT" \
+  '{model:$model,prompt:$prompt,stream:false}' > "$REQ_JSON"
+
+# ── Background GPU sampler ────────────────────────────────────────────────────
+_SAMPLER_PID=''
+_start_sampler() {
+  local run="$1"
+  (
+    local interval; interval="$(awk -v m="$SAMPLE_MS" 'BEGIN{printf "%.3f",m/1000}')"
+    while true; do
+      local now busy used_raw total_raw freq power_raw temp_raw
+      now="$(date +%s.%N)"
+      gpu_read_stats "$DEV" 2>/dev/null || true
+      # Write directly from the subshell – CSV append is atomic for short lines
+      printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$run" "$now" "$GPU_BUSY" "$GPU_USED_MIB" "$GPU_TOTAL_MIB" \
+        "${GPU_FREQ:-}" "${GPU_POWER_W:-}" "${GPU_TEMP_C:-}" \
+        >> "$SAMPLES_CSV"
+      sleep "$interval"
+    done
+  ) &
+  _SAMPLER_PID=$!
+}
+
+_stop_sampler() {
+  if [[ -n "$_SAMPLER_PID" ]]; then
+    kill "$_SAMPLER_PID" 2>/dev/null || true
+    wait "$_SAMPLER_PID" 2>/dev/null || true
+    _SAMPLER_PID=''
+  fi
+}
+trap '_stop_sampler' EXIT INT TERM
+
+# ── Aggregate samples for a given run ─────────────────────────────────────────
+_agg_samples() {
+  local run="$1"
+  awk -F, -v r="$run" '
+    NR>1 && $1==r && $3!="" {
+      c++
+      busy+=$3; if($3>bmax) bmax=$3
+      if($4!=""){vram+=$4; if($4>vmax) vmax=$4}
+      if($6!=""){freq+=$6; if($6>fmax) fmax=$6}
+      if($7!=""){pwr+=$7;  if($7>pwmax) pwmax=$7}
+      if($8!=""){tmp+=$8;  if($8>tmax)  tmax=$8}
+    }
+    END {
+      printf "%d %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f",
+        c,
+        (c?busy/c:0),(bmax+0),
+        (c?vram/c:0),(vmax+0),
+        (c?freq/c:0),(fmax+0),
+        (c?pwr/c:0), (pwmax+0),
+        (c?tmp/c:0), (tmax+0)
+    }
+  ' "$SAMPLES_CSV"
+}
+
+# ── Single inference call ─────────────────────────────────────────────────────
+_run_once() {
+  local run_label="$1"
+  local resp_json="$OUT_DIR/resp_run${run_label}_${STAMP}.json"
+
+  _start_sampler "$run_label"
+  curl -fsS --max-time 300 "$HOST/api/generate" \
+    -H 'Content-Type: application/json' \
+    -d @"$REQ_JSON" > "$resp_json"
+  _stop_sampler
+
+  local prompt_toks eval_toks total_ns load_ns prompt_ns eval_ns resp_chars
+  prompt_toks="$(jq -r '.prompt_eval_count // 0'  "$resp_json")"
+  eval_toks="$(  jq -r '.eval_count        // 0'  "$resp_json")"
+  total_ns="$(   jq -r '.total_duration    // 0'  "$resp_json")"
+  load_ns="$(    jq -r '.load_duration     // 0'  "$resp_json")"
+  prompt_ns="$(  jq -r '.prompt_eval_duration // 0' "$resp_json")"
+  eval_ns="$(    jq -r '.eval_duration     // 0'  "$resp_json")"
+  resp_chars="$( jq -r '(.response//"") | length' "$resp_json")"
+
+  local total_s load_s prompt_s eval_s eval_tps total_tps
+  total_s="$(ns_to_s "$total_ns")"
+  load_s="$( ns_to_s "$load_ns")"
+  prompt_s="$(ns_to_s "$prompt_ns")"
+  eval_s="$(  ns_to_s "$eval_ns")"
+  eval_tps="$(div_fmt "$eval_toks"  "$eval_s")"
+  total_tps="$(div_fmt "$eval_toks" "$total_s")"
+
+  read -r SC BAVG BMAX VAVG VMAX FAVG FMAX PAVG PMAX TAVG TMAX \
+    < <(_agg_samples "$run_label")
+
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$run_label" "$(date '+%F %T')" "$MODEL" "$CARD" "$DRIVER" \
+    "$prompt_toks" "$eval_toks" "$load_s" "$prompt_s" "$eval_s" "$total_s" \
+    "$eval_tps" "$total_tps" "$resp_chars" \
+    "$SC" "$BAVG" "$BMAX" "$VAVG" "$VMAX" "$FAVG" "$FMAX" "$PAVG" "$PMAX" "$TAVG" "$TMAX" \
+    >> "$SUMMARY_CSV"
+
+  (( QUIET )) && return
+
+  printf "\n%b── Run %-3s%b  eval %b%s tok/s%b  (%s gen tokens, %ss eval)\n" \
+    "$C_CYAN" "$run_label" "$C_RESET" \
+    "$C_BOLD" "$eval_tps" "$C_RESET" \
+    "$eval_toks" "$eval_s"
+  printf "            GPU busy avg/max: %s / %s %%  |  VRAM avg: %s MiB  |  Power avg: %s W  |  Temp avg: %s °C\n" \
+    "$BAVG" "$BMAX" "$VAVG" "$PAVG" "$TAVG"
+}
+
+# ── Generate markdown report ──────────────────────────────────────────────────
+_write_report() {
+  awk -F, 'NR>1{
+    n++; etps+=$12; ttps+=$13
+    bavg+=$16; bmax+=$17; vavg+=$18; vmax+=$19
+    pavg+=$22; pmax+=$23; tavg+=$24; tmax+=$25
+    if($12>best_tps){best_tps=$12; best_run=$1}
+    if(!min_tps || $12<min_tps) min_tps=$12
+  }
+  END {
+    printf "## Ollama / Intel Arc Benchmark Report\n\n"
+    printf "| Metric | Value |\n|---|---|\n"
+    printf "| Model | %s |\n",      "'$MODEL'"
+    printf "| Card | %s (%s) |\n",  "'$CARD'", "'$DRIVER'"
+    printf "| Runs | %d |\n", n
+    printf "| Avg eval tok/s | **%.2f** |\n", (n?etps/n:0)
+    printf "| Best eval tok/s | %.2f (run %s) |\n", best_tps, best_run
+    printf "| Min eval tok/s | %.2f |\n", min_tps
+    printf "| Avg total tok/s | %.2f |\n", (n?ttps/n:0)
+    printf "| Avg GPU busy | %.1f %% |\n", (n?bavg/n:0)
+    printf "| Peak GPU busy | %.1f %% |\n", (n?bmax/n:0)
+    printf "| Avg VRAM used | %.1f MiB |\n", (n?vavg/n:0)
+    printf "| Peak VRAM used | %.1f MiB |\n", (n?vmax/n:0)
+    printf "| Avg power | %.2f W |\n", (n?pavg/n:0)
+    printf "| Peak power | %.2f W |\n", (n?pmax/n:0)
+    printf "| Avg temp | %.1f °C |\n", (n?tavg/n:0)
+    printf "| Peak temp | %.1f °C |\n\n", (n?tmax/n:0)
+    if (n && bavg/n < 10)
+      printf "> ⚠️  Average GPU busy < 10%% – possible CPU fallback. Check OLLAMA_GPU or driver.\n\n"
+  }' "$SUMMARY_CSV" > "$REPORT_MD"
+  printf '\n## Prompt\n\n```\n%s\n```\n' "$PROMPT" >> "$REPORT_MD"
+  printf '\n## Artifacts\n\n- Summary CSV: `%s`\n- Samples CSV: `%s`\n' \
+    "$SUMMARY_CSV" "$SAMPLES_CSV" >> "$REPORT_MD"
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+printf "%b╔══════════════════════════════════════════════════════════╗%b\n" "$C_MAG" "$C_RESET"
+printf "%b║   arc-ollama-hud / bench                                 ║%b\n" "$C_MAG" "$C_RESET"
+printf "%b╚══════════════════════════════════════════════════════════╝%b\n" "$C_MAG" "$C_RESET"
+printf "  Model:   %b%s%b\n  Card:    %s (%s)\n  Runs:    %s\n  Out dir: %s\n\n" \
+  "$C_BOLD" "$MODEL" "$C_RESET" "$CARD" "$DRIVER" "$RUNS" "$OUT_DIR"
+
+if (( WARMUP )); then
+  printf "%b  warm-up run (discarded)…%b\n" "$C_DIM" "$C_RESET"
+  _run_once "warmup" 2>/dev/null || true
+  # Remove warmup row from CSV
+  grep -v '^warmup,' "$SUMMARY_CSV" > "$SUMMARY_CSV.tmp" && mv "$SUMMARY_CSV.tmp" "$SUMMARY_CSV"
+fi
+
+for run in $(seq 1 "$RUNS"); do
+  printf "%b  run %s / %s …%b" "$C_CYAN" "$run" "$RUNS" "$C_RESET"
+  _run_once "$run"
+done
+
+_write_report
+
+printf "\n%b✔ Done%b\n" "$C_GREEN" "$C_RESET"
+cat "$REPORT_MD"
+printf "\n  Summary CSV : %s\n  Samples CSV : %s\n  Report MD   : %s\n" \
+  "$SUMMARY_CSV" "$SAMPLES_CSV" "$REPORT_MD"
