@@ -56,7 +56,18 @@ while getopts ':m:p:P:r:s:o:H:c:wqh' opt; do
   esac
 done
 
-[[ -n "$PROMPT_FILE" ]] && PROMPT="$(<"$PROMPT_FILE")"
+# B2: Validate numeric inputs
+[[ "$RUNS" =~ ^[0-9]+$ && "$RUNS" -gt 0 ]] \
+  || { printf '%bError: -r RUNS must be a positive integer (got: %s)%b\n' "$C_RED" "$RUNS" "$C_RESET" >&2; exit 1; }
+[[ "$SAMPLE_MS" =~ ^[0-9]+$ && "$SAMPLE_MS" -gt 0 ]] \
+  || { printf '%bError: -s MS must be a positive integer (got: %s)%b\n' "$C_RED" "$SAMPLE_MS" "$C_RESET" >&2; exit 1; }
+
+# B3: Validate prompt file exists before reading
+if [[ -n "$PROMPT_FILE" ]]; then
+  [[ -f "$PROMPT_FILE" ]] \
+    || { printf '%bPrompt file not found: %s%b\n' "$C_RED" "$PROMPT_FILE" "$C_RESET" >&2; exit 1; }
+  PROMPT="$(<"$PROMPT_FILE")"
+fi
 
 # ── Resolve model ─────────────────────────────────────────────────────────────
 if [[ -z "$MODEL" ]]; then
@@ -80,6 +91,10 @@ CARD_PATH="$(gpu_find_card 2>/dev/null)" || CARD_PATH=''
 DEV="${CARD_PATH:+$CARD_PATH/device}"
 CARD="$(basename "$CARD_PATH" 2>/dev/null || echo 'unknown')"
 DRIVER="$(basename "$(readlink -f "$DEV/driver" 2>/dev/null)" 2>/dev/null || echo '?')"
+# U3: Warn when no GPU is detected so users know metrics will be empty
+if [[ -z "$CARD_PATH" ]]; then
+  printf '%b  Warning: No Intel GPU detected. GPU metrics will be unavailable.%b\n' "$C_YELLOW" "$C_RESET" >&2
+fi
 
 # ── CSV headers ───────────────────────────────────────────────────────────────
 printf 'run,timestamp,model,card,driver,'
@@ -155,9 +170,14 @@ _run_once() {
   local resp_json="$OUT_DIR/resp_run${run_label}_${STAMP}.json"
 
   _start_sampler "$run_label"
-  curl -fsS --max-time 300 "$HOST/api/generate" \
-    -H 'Content-Type: application/json' \
-    -d @"$REQ_JSON" > "$resp_json"
+  # B7: Treat curl failure as a skippable run rather than a hard exit
+  if ! curl -fsS --max-time 300 "$HOST/api/generate" \
+       -H 'Content-Type: application/json' \
+       -d @"$REQ_JSON" > "$resp_json" 2>/dev/null; then
+    _stop_sampler
+    printf '%bRun %s failed (curl/Ollama error — skipping).%b\n' "$C_YELLOW" "$run_label" "$C_RESET" >&2
+    return 1
+  fi
   _stop_sampler
 
   local prompt_toks eval_toks total_ns load_ns prompt_ns eval_ns resp_chars
@@ -199,31 +219,35 @@ _run_once() {
 
 # ── Generate markdown report ──────────────────────────────────────────────────
 _write_report() {
-  awk -F, 'NR>1{
+  awk -F, \
+    -v model="$MODEL" -v card="$CARD" -v driver="$DRIVER" \
+  'NR>1{
     n++; etps+=$12; ttps+=$13
-    bavg+=$16; bmax+=$17; vavg+=$18; vmax+=$19
-    pavg+=$22; pmax+=$23; tavg+=$24; tmax+=$25
+    bavg+=$16; if($17>bmax) bmax=$17
+    vavg+=$18; if($19>vmax) vmax=$19
+    pavg+=$22; if($23>pmax) pmax=$23
+    tavg+=$24; if($25>tmax) tmax=$25
     if($12>best_tps){best_tps=$12; best_run=$1}
     if(!min_tps || $12<min_tps) min_tps=$12
   }
   END {
     printf "## Ollama / Intel Arc Benchmark Report\n\n"
     printf "| Metric | Value |\n|---|---|\n"
-    printf "| Model | %s |\n",      "'$MODEL'"
-    printf "| Card | %s (%s) |\n",  "'$CARD'", "'$DRIVER'"
+    printf "| Model | %s |\n",      model
+    printf "| Card | %s (%s) |\n",  card, driver
     printf "| Runs | %d |\n", n
     printf "| Avg eval tok/s | **%.2f** |\n", (n?etps/n:0)
     printf "| Best eval tok/s | %.2f (run %s) |\n", best_tps, best_run
     printf "| Min eval tok/s | %.2f |\n", min_tps
     printf "| Avg total tok/s | %.2f |\n", (n?ttps/n:0)
     printf "| Avg GPU busy | %.1f %% |\n", (n?bavg/n:0)
-    printf "| Peak GPU busy | %.1f %% |\n", (n?bmax/n:0)
+    printf "| Peak GPU busy | %.1f %% |\n", bmax
     printf "| Avg VRAM used | %.1f MiB |\n", (n?vavg/n:0)
-    printf "| Peak VRAM used | %.1f MiB |\n", (n?vmax/n:0)
+    printf "| Peak VRAM used | %.1f MiB |\n", vmax
     printf "| Avg power | %.2f W |\n", (n?pavg/n:0)
-    printf "| Peak power | %.2f W |\n", (n?pmax/n:0)
+    printf "| Peak power | %.2f W |\n", pmax
     printf "| Avg temp | %.1f °C |\n", (n?tavg/n:0)
-    printf "| Peak temp | %.1f °C |\n\n", (n?tmax/n:0)
+    printf "| Peak temp | %.1f °C |\n\n", tmax
     if (n && bavg/n < 10)
       printf "> ⚠️  Average GPU busy < 10%% – possible CPU fallback. Check OLLAMA_GPU or driver.\n\n"
   }' "$SUMMARY_CSV" > "$REPORT_MD"
@@ -241,14 +265,17 @@ printf "  Model:   %b%s%b\n  Card:    %s (%s)\n  Runs:    %s\n  Out dir: %s\n\n"
 
 if (( WARMUP )); then
   printf "%b  warm-up run (discarded)…%b\n" "$C_DIM" "$C_RESET"
-  _run_once "warmup" 2>/dev/null || true
+  # U5: Always suppress per-run output for the warmup regardless of QUIET setting.
+  #     Save/restore QUIET because bash propagates VAR=val assignments to the
+  #     current shell when applied to functions (unlike external commands).
+  _saved_quiet="$QUIET"; QUIET=1; _run_once "warmup" || true; QUIET="$_saved_quiet"
   # Remove warmup row from CSV
   grep -v '^warmup,' "$SUMMARY_CSV" > "$SUMMARY_CSV.tmp" && mv "$SUMMARY_CSV.tmp" "$SUMMARY_CSV"
 fi
 
 for run in $(seq 1 "$RUNS"); do
   printf "%b  run %s / %s …%b" "$C_CYAN" "$run" "$RUNS" "$C_RESET"
-  _run_once "$run"
+  _run_once "$run" || true
 done
 
 _write_report

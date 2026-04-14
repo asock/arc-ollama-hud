@@ -32,7 +32,7 @@ Pure Bash. No `intel_gpu_top`. No Python. Works on `xe` and `i915` drivers via s
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/arc-ollama-hud
+git clone https://github.com/asock/arc-ollama-hud
 cd arc-ollama-hud
 ./install.sh          # symlinks to ~/.local/bin (pass a path to override)
 ```

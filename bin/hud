@@ -10,6 +10,12 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 require_cmds curl jq ps awk || exit 1
 
+# B4: Reject non-numeric INTERVAL before the first sleep hits
+if [[ -n "${1:-}" && ! "${1}" =~ ^[0-9]*\.?[0-9]+$ ]]; then
+  printf '%bINTERVAL must be a positive number (e.g. 0.5, 1, 2) — got: %s%b\n' \
+    "$C_RED" "$1" "$C_RESET" >&2
+  exit 1
+fi
 INTERVAL="${1:-1}"
 OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
 STATE_DIR="${STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/arc-ollama-hud}"
@@ -29,9 +35,18 @@ _olm_fetch() {
 
 _draw_header() {
   local ts="$1"
+  # B5: Build the inner content, measure its visible length, then pad so the
+  #     right ┃ always aligns with the 80-char wide top/bottom borders.
+  local inner="  ARC / xe + OLLAMA NERD HUD  [interval ${INTERVAL}s]  ${ts}  "
+  local inner_len=${#inner}
+  local box_inner=78          # characters between the two corner/border chars
+  local pad=$(( box_inner - inner_len ))
+  (( pad < 0 )) && pad=0
+  local padding; padding="$(printf '%*s' "$pad" '')"
   printf "%b┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓%b\n" "$C_MAG" "$C_RESET"
-  printf "%b┃%b  ARC / xe + OLLAMA NERD HUD  %b[interval %ss]%b  %b%s%b  ┃\n" \
-    "$C_MAG" "$C_RESET" "$C_DIM" "$INTERVAL" "$C_RESET" "$C_DIM" "$ts" "$C_RESET"
+  printf "%b┃%b  ARC / xe + OLLAMA NERD HUD  %b[interval %ss]%b  %b%s%b%s%b┃%b\n" \
+    "$C_MAG" "$C_RESET" "$C_DIM" "$INTERVAL" "$C_RESET" "$C_DIM" "$ts" "$C_RESET" \
+    "$padding" "$C_MAG" "$C_RESET"
   printf "%b┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛%b\n" "$C_MAG" "$C_RESET"
 }
 
@@ -109,8 +124,11 @@ _draw_processes() {
   ui_panel "Processes"
   printf "%b  %-7s %-7s %-6s %-6s %-10s %s%b\n" \
     "$C_DIM" "PID" "PPID" "%CPU" "%MEM" "ETIME" "CMD" "$C_RESET"
+  # B6: Dropped 'intel' from the regex — it matched any process with an Intel
+  #     library in its path (MKL, oneAPI, etc.), flooding the table with noise.
+  #     'ollama', 'llama', 'vulkan', and 'gpu' are specific enough to remain.
   ps -eo pid,ppid,%cpu,%mem,etime,cmd --sort=-%cpu 2>/dev/null \
-    | grep -Ei 'ollama|llama|vulkan|intel|gpu' \
+    | grep -Ei 'ollama|llama|vulkan|gpu' \
     | grep -v grep \
     | head -n 10 \
     || echo "  none"

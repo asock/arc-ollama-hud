@@ -67,9 +67,13 @@ gpu_read_stats() {
   GPU_TOTAL_RAW="$(gpu_read "$dev/mem_info_vram_total" "$dev/mem_info_local_memory_total")"
   # shellcheck disable=SC2046
   GPU_FREQ="$(gpu_read $(gpu_freq_paths "$dev"))"
-  local pwr_raw temp_raw
-  pwr_raw="$(gpu_read "$dev"/hwmon/*/power1_average)"
-  temp_raw="$(gpu_read "$dev"/hwmon/*/temp1_input)"
+  # S2: Guard the hwmon globs — if $dev is empty the glob expands from /
+  #     which is unintended and wastes a filesystem traversal.
+  local pwr_raw='' temp_raw=''
+  if [[ -n "$dev" ]]; then
+    pwr_raw="$(gpu_read "$dev"/hwmon/*/power1_average)"
+    temp_raw="$(gpu_read "$dev"/hwmon/*/temp1_input)"
+  fi
   GPU_POWER_W="$(uw_to_w "$pwr_raw")"
   GPU_TEMP_C="$(mc_to_c "$temp_raw")"
   GPU_USED_MIB="$(bytes_to_mib "$GPU_USED_RAW")"
@@ -118,14 +122,19 @@ ui_bar() {
 }
 
 # Sparkline from a history file  usage: ui_spark HISTFILE [MAX]
+# U4: Sparkline width adapts to terminal width (half the terminal, 20–60 chars)
 ui_spark() {
   local file="$1" max="${2:-100}" out='' idx v
   [[ -f "$file" ]] || { echo '─'; return; }
+  local cols; cols="$(tput cols 2>/dev/null || echo 80)"
+  local spark_width=$(( cols / 2 ))
+  (( spark_width < 20 )) && spark_width=20
+  (( spark_width > 60 )) && spark_width=60
   while IFS= read -r v; do
     v="$(safe_num "$v")"
     idx=$(awk -v n="$v" -v m="$max" 'BEGIN{if(m<=0)m=1;i=int((n/m)*7);if(i<0)i=0;if(i>7)i=7;print i}')
     out+="${SPARKLINE_CHARS[$idx]}"
-  done < <(tail -n 40 "$file" 2>/dev/null)
+  done < <(tail -n "$spark_width" "$file" 2>/dev/null)
   echo "$out"
 }
 
