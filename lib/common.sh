@@ -167,7 +167,8 @@ ui_spark() {
 # Append value to rolling history file (keeps last N lines)
 hist_append() {
   local file="$1" val="$2" max="${3:-240}"
-  echo "$val" >> "$file"
+  # Silently skip when the directory is not writable (U7 warns at startup).
+  echo "$val" >> "$file" 2>/dev/null || return 0
   local lines; lines=$(wc -l < "$file" 2>/dev/null)
   if (( lines > max )); then
     tail -n "$max" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
